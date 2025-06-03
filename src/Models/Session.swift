@@ -247,13 +247,13 @@ public struct Session: Codable, Equatable, Sendable {
 		/// The type of the tool.
 		public var type: String = "function"
 		/// The name of the function.
-		public var name: String
+		public var name: String? = nil
 		/// The description of the function.
-		public var description: String
+		public var description: String? = nil
 		/// Parameters of the function in JSON Schema.
-		public var parameters: FunctionParameters
+		public var parameters: FunctionParameters? = nil
 
-		public init(type: String = "function", name: String, description: String, parameters: FunctionParameters) {
+		public init(type: String = "function", name: String? = nil, description: String? = nil, parameters: FunctionParameters? = nil) {
 			self.type = type
 			self.name = name
 			self.description = description

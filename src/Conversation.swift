@@ -10,19 +10,26 @@ public enum ConversationError: Error {
 public final class Conversation: @unchecked Sendable {
 	private let client: RealtimeAPI
 	@MainActor private var isInterrupting: Bool = false
+  public var isResponding = false
+  public var isStreamingAudio = false
 	private let errorStream: AsyncStream<ServerError>.Continuation
+  private let functionCallStream: AsyncStream<Item.FunctionCall>.Continuation
 
 	private var task: Task<Void, Error>!
 	private let audioEngine = AVAudioEngine()
 	private let playerNode = AVAudioPlayerNode()
-	private let queuedSamples = UnsafeMutableArray<String>()
+	public let queuedSamples = UnsafeMutableArray<String>()
 	private let apiConverter = UnsafeInteriorMutable<AVAudioConverter>()
 	private let userConverter = UnsafeInteriorMutable<AVAudioConverter>()
 	private let desiredFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24000, channels: 1, interleaved: false)!
-
+  
+  public var isRecording = false
+  private var recordingFile: AVAudioFile? = nil
+  
 	/// A stream of errors that occur during the conversation.
 	public let errors: AsyncStream<ServerError>
-
+  public let functionCall: AsyncStream<Item.FunctionCall>
+  
 	/// The unique ID of the conversation.
 	@MainActor public private(set) var id: String?
 
@@ -60,6 +67,7 @@ public final class Conversation: @unchecked Sendable {
 	private init(client: RealtimeAPI) {
 		self.client = client
 		(errors, errorStream) = AsyncStream.makeStream(of: ServerError.self)
+    (functionCall, functionCallStream) = AsyncStream.makeStream(of: Item.FunctionCall.self)
 
 		let events = client.events
 		task = Task.detached { [weak self] in
@@ -90,6 +98,7 @@ public final class Conversation: @unchecked Sendable {
 	deinit {
 		task.cancel()
 		errorStream.finish()
+    functionCallStream.finish()
 
 		Task { [playerNode, audioEngine] in
 			Self.cleanUpAudio(playerNode: playerNode, audioEngine: audioEngine)
@@ -125,7 +134,7 @@ public final class Conversation: @unchecked Sendable {
 
 	/// Make changes to the current session
 	/// Note that this will fail if the session hasn't started yet. Use `whenConnected` to ensure the session is ready.
-	public func updateSession(withChanges callback: (inout Session) -> Void) async throws {
+	@MainActor public func updateSession(withChanges callback: (inout Session) -> Void) async throws {
 		guard var session = await session else {
 			throw ConversationError.sessionNotFound
 		}
@@ -163,7 +172,7 @@ public final class Conversation: @unchecked Sendable {
 	/// Optionally, you can provide a response configuration to customize the model's behavior.
 	/// > Note: Calling this function will automatically call `interruptSpeech` if the model is currently speaking.
 	public func send(from role: Item.ItemRole, text: String, response: Response.Config? = nil) async throws {
-		if await handlingVoice { await interruptSpeech() }
+//		if await handlingVoice { await interruptSpeech() }
 
 		try await send(event: .createConversationItem(Item(message: Item.Message(id: String(randomLength: 32), from: role, content: [.input_text(text)]))))
 		try await send(event: .createResponse(response))
@@ -189,10 +198,9 @@ public extension Conversation {
 				self?.processAudioBufferFromUser(buffer: buffer)
 			}
 		}
-
 		isListening = true
 	}
-
+  
 	/// Stop listening to the user's microphone.
 	/// This won't stop playing back model responses. To fully stop handling voice conversations, call `stopHandlingVoice`.
 	@MainActor func stopListening() {
@@ -224,7 +232,7 @@ public extension Conversation {
 
 			#if os(iOS)
 			let audioSession = AVAudioSession.sharedInstance()
-			try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
+			try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
 			try audioSession.setActive(true)
 			#endif
 
@@ -272,6 +280,7 @@ public extension Conversation {
 		Self.cleanUpAudio(playerNode: playerNode, audioEngine: audioEngine)
 
 		isListening = false
+    isRecording = false
 		handlingVoice = false
 	}
 
@@ -299,8 +308,10 @@ public extension Conversation {
 /// Event handling private API
 private extension Conversation {
 	@MainActor func handleEvent(_ event: ServerEvent) {
+    debugPrint("[Server Events] \(event)")
 		switch event {
 			case let .error(event):
+      debugPrint("\(event.error.code)")
 				errorStream.yield(event.error)
 			case let .sessionCreated(event):
 				connected = true
@@ -365,6 +376,7 @@ private extension Conversation {
 			case let .responseFunctionCallArgumentsDone(event):
 				updateEvent(id: event.itemId) { functionCall in
 					functionCall.arguments = event.arguments
+          functionCallStream.yield(functionCall)
 				}
 			case .inputAudioBufferSpeechStarted:
 				isUserSpeaking = true
@@ -377,6 +389,11 @@ private extension Conversation {
 
 					message = newMessage
 				}
+    case .responseCreated:
+      isResponding = true
+      
+    case .responseDone:
+      isResponding = false
 			default:
 				return
 		}
@@ -441,55 +458,59 @@ private extension Conversation {
 		playerNode.play()
 	}
 
-	private func processAudioBufferFromUser(buffer: AVAudioPCMBuffer) {
-		let ratio = desiredFormat.sampleRate / buffer.format.sampleRate
+  private func processAudioBufferFromUser(buffer: AVAudioPCMBuffer) {
+      let ratio = desiredFormat.sampleRate / buffer.format.sampleRate
+      guard let convertedBuffer = convertBuffer(buffer: buffer, using: userConverter.get()!, capacity: AVAudioFrameCount(Double(buffer.frameLength) * ratio)) else {
+          print("Buffer conversion failed.")
+          return
+      }
+      
+      guard let sampleBytes = convertedBuffer.audioBufferList.pointee.mBuffers.mData else { return }
+      let audioData = Data(bytes: sampleBytes, count: Int(convertedBuffer.audioBufferList.pointee.mBuffers.mDataByteSize))
+      
+      Task {
+          try await send(audioDelta: audioData)
+      }
+      
+      if self.isRecording, let recordingFile = self.recordingFile {
+          try? recordingFile.write(from: convertedBuffer)
+      }
+  }
 
-		guard let convertedBuffer = convertBuffer(buffer: buffer, using: userConverter.get()!, capacity: AVAudioFrameCount(Double(buffer.frameLength) * ratio)) else {
-			print("Buffer conversion failed.")
-			return
-		}
+  private func convertBuffer(buffer: AVAudioPCMBuffer, using converter: AVAudioConverter, capacity: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+      if buffer.format == converter.outputFormat {
+          return buffer
+      }
+      
+      guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {
+          print("Failed to create converted audio buffer.")
+          return nil
+      }
+      
+      var error: NSError?
+      var allSamplesReceived = false
+      
+      let status = converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
+          if allSamplesReceived {
+              outStatus.pointee = .noDataNow
+              return nil
+          }
+          
+          allSamplesReceived = true
+          outStatus.pointee = .haveData
+          return buffer
+      }
+      
+      if status == .error {
+          if let error = error {
+              print("Error during conversion: \(error.localizedDescription)")
+          }
+          return nil
+      }
+      
+      return convertedBuffer
+  }
 
-		guard let sampleBytes = convertedBuffer.audioBufferList.pointee.mBuffers.mData else { return }
-		let audioData = Data(bytes: sampleBytes, count: Int(convertedBuffer.audioBufferList.pointee.mBuffers.mDataByteSize))
-
-		Task {
-			try await send(audioDelta: audioData)
-		}
-	}
-
-	private func convertBuffer(buffer: AVAudioPCMBuffer, using converter: AVAudioConverter, capacity: AVAudioFrameCount) -> AVAudioPCMBuffer? {
-		if buffer.format == converter.outputFormat {
-			return buffer
-		}
-
-		guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {
-			print("Failed to create converted audio buffer.")
-			return nil
-		}
-
-		var error: NSError?
-		var allSamplesReceived = false
-
-		let status = converter.convert(to: convertedBuffer, error: &error) { _, outStatus in
-			if allSamplesReceived {
-				outStatus.pointee = .noDataNow
-				return nil
-			}
-
-			allSamplesReceived = true
-			outStatus.pointee = .haveData
-			return buffer
-		}
-
-		if status == .error {
-			if let error = error {
-				print("Error during conversion: \(error.localizedDescription)")
-			}
-			return nil
-		}
-
-		return convertedBuffer
-	}
 }
 
 // Other private methods
@@ -501,11 +522,25 @@ extension Conversation {
 		withObservationTracking { _ = queuedSamples.isEmpty } onChange: { [weak self] in
 			Task { @MainActor in
 				guard let self else { return }
-
 				self.isPlaying = self.queuedSamples.isEmpty
+        debugPrint("[Is playing] \(self.isPlaying)")
 			}
 
 			self?._keepIsPlayingPropertyUpdated()
 		}
 	}
+}
+
+extension Conversation {
+  @MainActor public func record(for duration: Duration, url: URL) async throws {
+    guard isRecording == false else { return }
+    self.recordingFile = try AVAudioFile(forWriting: url, settings: desiredFormat.settings, commonFormat: .pcmFormatInt16, interleaved: false)
+    debugPrint("Start recording")
+    isRecording = true
+    
+    try await Task.sleep(for: duration)
+    debugPrint("Stop recording, audio File size: \(recordingFile?.length ?? 0)")
+    isRecording = false
+    self.recordingFile = nil
+  }
 }

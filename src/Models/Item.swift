@@ -116,7 +116,18 @@ public enum Item: Identifiable, Equatable, Sendable {
 				return functionCallOutput.id
 		}
 	}
-
+  
+  public var status: ItemStatus {
+    switch self {
+      case let .message(message):
+        return message.status
+      case let .functionCall(functionCall):
+        return functionCall.status
+      case let .functionCallOutput(functionCallOutput):
+      return .completed
+    }
+  }
+  
 	public init(message: Message) {
 		self = .message(message)
 	}
